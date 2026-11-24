@@ -53,6 +53,7 @@ HIBERNATE_AFTER = None         # seconds on battery before hibernating; None = n
 GPU_CAP_WATTS = 150            # GPU draw that must not be exceeded while on battery
 GPU_LOCK_MHZ = None            # graphics clock while halted; None = lowest supported
 STATE_FILE = "/run/mains-watch/state.json"
+PAUSE_FILE = "/var/lib/mains-watch/pause.json"      # present while protection is paused
 EVENTS_FILE = "/var/lib/mains-watch/events.jsonl"   # outage history (survives reboots)
 DASHBOARD_PORT = 8099          # http://127.0.0.1:<port>; 0 = no dashboard
 CONFIG_FILE = os.environ.get("MAINS_WATCH_CONF", "/etc/mains-watch.conf")
@@ -183,7 +184,7 @@ def load_config(path: str) -> None:
         pass
     g = globals()
     for key in ("SENSOR_IP", "ROUTER_IP", "CHECK_EVERY", "OUTAGE_CONFIRM", "RESTORE_CONFIRM",
-                "HIBERNATE_AFTER", "SENSOR_CHECK", "GPU_CAP_WATTS", "GPU_LOCK_MHZ", "STATE_FILE", "EVENTS_FILE", "DASHBOARD_PORT", "LOG_FILE"):
+                "HIBERNATE_AFTER", "SENSOR_CHECK", "GPU_CAP_WATTS", "GPU_LOCK_MHZ", "STATE_FILE", "PAUSE_FILE", "EVENTS_FILE", "DASHBOARD_PORT", "LOG_FILE"):
         raw = os.environ.get(key, values.get(key))
         if raw is None:
             continue
@@ -214,14 +215,16 @@ def main() -> None:
         handlers.append(logging.FileHandler(LOG_FILE))
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
-    from dashboard import record, serve
+    from dashboard import Pause, record, serve
+    pause = Pause(PAUSE_FILE)
     from onboard import Setup
     live = {"setup_needed": not SENSOR_IP, "on_battery": False, "since": None, "sensor": SENSOR_IP,
-            "cap_watts": GPU_CAP_WATTS, "gpu_watts": None, "frozen": 0}
+            "cap_watts": GPU_CAP_WATTS, "gpu_watts": None, "frozen": 0,
+            "paused": False, "paused_until": None}
     setup = Setup(CONFIG_FILE, restart=lambda: os.kill(os.getpid(), signal.SIGTERM))
     if DASHBOARD_PORT:
         try:
-            serve(DASHBOARD_PORT, EVENTS_FILE, live, setup)
+            serve(DASHBOARD_PORT, EVENTS_FILE, live, setup, pause)
         except OSError as exc:
             logging.warning("dashboard not started: %s", exc)
     if not SENSOR_IP:
@@ -288,8 +291,27 @@ def main() -> None:
         gpu.resume()                            # stale state with nothing to hold it
 
     pool = ThreadPoolExecutor(max_workers=2)
+    was_paused = False
     while True:
         started = time.monotonic()
+        until = pause.until()
+        if until is not None:                   # user switched protection off: do nothing
+            if not was_paused:
+                logging.info("Protection paused: sensor will not halt the GPU")
+                record(EVENTS_FILE, "paused")
+                was_paused = True
+                if watcher.on_battery or (gpu and gpu.halted):
+                    normal()                    # release anything already frozen
+                watcher = Watcher()
+            live.update(paused=True, paused_until=None if until == float("inf") else until,
+                        on_battery=False, since=None)
+            time.sleep(max(0.0, CHECK_EVERY - (time.monotonic() - started)))
+            continue
+        if was_paused:
+            logging.info("Protection back on")
+            record(EVENTS_FILE, "unpaused")
+            was_paused = False
+            live.update(paused=False, paused_until=None)
         # Ping both at once so a miss costs one timeout, not two.
         f_sensor, f_router = pool.submit(probe, SENSOR_IP, SENSOR_CHECK), pool.submit(ping, router_ip)
         sensor_ok = f_sensor.result()

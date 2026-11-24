@@ -55,7 +55,7 @@ class DaemonTests(unittest.TestCase):
                    FAKE_GPU_DIR=str(self.d / "gpu"), FAKE_NET_DIR=str(self.d / "net"),
                    MAINS_WATCH_CONF=str(self.d / "none.conf"), SENSOR_IP=SENSOR,
                    ROUTER_IP=ROUTER, CHECK_EVERY="0.2", STATE_FILE=str(self.d / "state.json"),
-                   EVENTS_FILE=str(self.d / "events.jsonl"), DASHBOARD_PORT=str(self.port))
+                   EVENTS_FILE=str(self.d / "events.jsonl"), PAUSE_FILE=str(self.d / "pause.json"), DASHBOARD_PORT=str(self.port))
         self.daemon = subprocess.Popen([sys.executable, str(ROOT / "mains_watch.py")], env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
@@ -130,6 +130,45 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual([e["event"] for e in d["recent"]], ["restored", "lost", "restored", "lost"])
         page = urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=2).read()
         self.assertIn(b"Mains watch", page)
+
+    def post(self, path, body=None):
+        rq = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", json.dumps(body or {}).encode(),
+                                    {"X-Setup": "1", "Content-Type": "application/json"})
+        return json.load(urllib.request.urlopen(rq, timeout=5))
+
+    def test_pause_releases_gpu_ignores_outages_and_unpause_rearms(self):
+        self.start()
+        self.sensor_up(False)
+        self.wait_for(lambda: pstate(self.work.pid) == "T")
+        self.assertEqual(self.post("/api/pause", {"hours": 0}), {"ok": True})   # until switched back on
+        self.wait_for(lambda: pstate(self.work.pid) == "S")                    # frozen job released
+        self.wait_for(lambda: self.api()["paused"] and not self.api()["on_battery"])
+        self.assertFalse((self.d / "gpu" / "locked").exists())
+        time.sleep(2.0)                                                         # outage continues...
+        self.assertEqual(pstate(self.work.pid), "S")                            # ...but no halt
+        self.sensor_up(True)
+        self.sensor_up(False)
+        time.sleep(1.5)
+        self.assertEqual(pstate(self.work.pid), "S")
+        self.post("/api/unpause")
+        self.wait_for(lambda: pstate(self.work.pid) == "T")                     # still out: protects again
+        self.assertFalse(self.api()["paused"])
+        events = [e["event"] for e in self.api()["recent"]]
+        self.assertIn("paused", events)
+        self.assertIn("unpaused", events)
+
+    def test_pause_survives_daemon_restart(self):
+        self.start()
+        self.wait_for(lambda: self.api().get("outages_total") == 0)
+        self.post("/api/pause", {"hours": 1})
+        self.wait_for(lambda: self.api()["paused"])
+        self.daemon.kill(); self.daemon.wait(); self.daemon.stdout.close()
+        self.start()
+        self.sensor_up(False)
+        self.wait_for(lambda: self.api()["paused"])
+        time.sleep(1.5)
+        self.assertEqual(pstate(self.work.pid), "S")
+        self.assertGreater(self.api()["paused_until"], time.time())
 
     def test_router_down_too_is_not_an_outage(self):
         self.start()
@@ -240,6 +279,22 @@ class DaemonTests(unittest.TestCase):
                                                   "every": 1, "confirm": 3}), {"ok": True})
         self.daemon.wait(timeout=10)                          # exits so systemd restarts it
         self.assertIn("SENSOR_IP=192.168.1.77", (self.d / "new.conf").read_text())
+
+    def test_pause_unit(self):
+        from dashboard import Pause
+        p = Pause(str(self.d / "p.json"))
+        self.assertFalse(p.paused())
+        self.assertIn("error", p.set("abc"))
+        self.assertIn("error", p.set(-1))
+        p.set(1)
+        self.assertTrue(p.paused())
+        self.assertAlmostEqual(p.until() - time.time(), 3600, delta=5)
+        p.set(0)
+        self.assertEqual(p.until(), float("inf"))
+        (self.d / "p.json").write_text(json.dumps({"until": time.time() - 1}))
+        self.assertFalse(p.paused())                       # expired -> cleared
+        self.assertFalse((self.d / "p.json").exists())
+        p.clear(); p.clear()                               # idempotent
 
     def test_missing_sensor_ip_refuses_to_run(self):
         env = dict(os.environ, MAINS_WATCH_CONF=str(self.d / "none.conf"), SENSOR_IP="", DASHBOARD_PORT="0")

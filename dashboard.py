@@ -21,6 +21,55 @@ def record(path: str, event: str, **fields) -> None:
         pass
 
 
+class Pause:
+    """Pause/resume switch for the sensor-triggered halt, kept in a file so it survives restarts.
+    The file holds {"until": epoch} (timed) or {"until": null} (until switched back on)."""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+
+    def until(self):
+        """None if not paused; float('inf') if paused indefinitely; else the end time."""
+        try:
+            data = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return None
+        until = data.get("until")
+        if until is None:
+            return float("inf")
+        if time.time() >= until:
+            self.clear()
+            return None
+        return float(until)
+
+    def paused(self) -> bool:
+        return self.until() is not None
+
+    def set(self, hours) -> dict:
+        try:
+            hours = float(hours or 0)
+            if not 0 <= hours <= 24 * 365:
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"error": "Invalid duration."}
+        until = time.time() + hours * 3600 if hours else None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps({"until": until}))
+        except OSError as exc:
+            return {"error": f"Cannot save pause state: {exc}"}
+        return {"ok": True}
+
+    def clear(self) -> dict:
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            return {"error": str(exc)}
+        return {"ok": True}
+
+
 def read_events(path: str) -> list:
     events = []
     try:
@@ -56,9 +105,13 @@ body{font:16px system-ui,sans-serif;max-width:720px;margin:2rem auto;padding:0 1
 #state{font-size:2rem;font-weight:700}.ok{color:#4ade80}.bad{color:#f87171}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem}
 .n{font-size:1.8rem;font-weight:700}.l{color:#9ca3af;font-size:.85rem}
+.hide{display:none}#pausebar{background:#78350f}button{font:inherit;padding:.3rem .7rem;margin:.2rem .3rem 0 0;border:0;border-radius:6px;background:#374151;color:#eee;cursor:pointer}
 table{width:100%;border-collapse:collapse}td{padding:.3rem .2rem;border-top:1px solid #333}
 </style>
-<div class=card><div id=state>...</div><div class=l id=sub></div><div class=l><a href=/setup style=color:#9ca3af>Settings / change sensor</a></div></div>
+<div class="card hide" id=pausebar><b>Protection is paused</b> <span id=pausetxt></span> - a power cut will NOT halt the GPU. <button onclick="pauseCall('/api/unpause')">Turn protection back on</button></div>
+<div class=card><div id=state>...</div><div class=l id=sub></div><div class=l><a href=/setup style=color:#9ca3af>Settings / change sensor</a></div>
+<div class=l id=pausectl>Sensor broken, old or a nuisance? Pause protection:
+<button onclick="pauseCall('/api/pause',1)">1 hour</button><button onclick="pauseCall('/api/pause',8)">8 hours</button><button onclick="pauseCall('/api/pause',0)">until I turn it on</button></div></div>
 <div class="card grid">
 <div><div class=n id=tot>-</div><div class=l>power cuts, all time</div></div>
 <div><div class=n id=today>-</div><div class=l>today</div></div>
@@ -70,9 +123,12 @@ table{width:100%;border-collapse:collapse}td{padding:.3rem .2rem;border-top:1px 
 <script>
 const dur=s=>s<60?Math.round(s)+' s':s<3600?Math.round(s/60)+' min':(s/3600).toFixed(1)+' h';
 const $=i=>document.getElementById(i);
+const pauseCall=async(u,h)=>{await fetch(u,{method:'POST',headers:{'Content-Type':'application/json','X-Setup':'1'},body:JSON.stringify({hours:h})});tick()};
 async function tick(){try{
  const d=await (await fetch('/api/status')).json();
  if(d.setup_needed){location='/setup';return}
+ $('pausebar').classList.toggle('hide',!d.paused);$('pausectl').classList.toggle('hide',!!d.paused);
+ $('pausetxt').textContent=d.paused_until?'until '+new Date(d.paused_until*1000).toLocaleString():'until you turn it back on';
  $('state').textContent=d.on_battery?'POWER CUT - GPU halted':'Mains OK';
  $('state').className=d.on_battery?'bad':'ok';
  $('sub').textContent=d.on_battery?'since '+new Date(d.since*1000).toLocaleTimeString()+' ('+dur(Date.now()/1000-d.since)+')':'sensor '+d.sensor+' answering';
@@ -81,7 +137,7 @@ async function tick(){try{
  $('gpu').textContent=d.gpu_watts==null?'n/a':Math.round(d.gpu_watts)+' W';
  $('cap').textContent=d.cap_watts;$('frozen').textContent=d.frozen;
  $('hist').innerHTML=d.recent.map(e=>'<tr><td>'+new Date(e.t*1000).toLocaleString()+'</td><td>'+
-  (e.event=='lost'?'power lost':e.event=='restored'?'power back (cut lasted '+dur(e.duration_s)+')':e.event)+'</td></tr>').join('');
+  (e.event=='paused'?'protection paused':e.event=='unpaused'?'protection turned back on':e.event=='lost'?'power lost':e.event=='restored'?'power back (cut lasted '+dur(e.duration_s)+')':e.event)+'</td></tr>').join('');
 }catch(e){$('state').textContent='service not reachable';$('state').className='bad'}}
 tick();setInterval(tick,2000);
 </script>"""
@@ -148,7 +204,7 @@ $('save').onclick=async()=>{busy($('save'),$('m4'),'Saving...');
 </script>"""
 
 
-def serve(port: int, events_path: str, live: dict, setup=None) -> None:
+def serve(port: int, events_path: str, live: dict, setup=None, pause=None) -> None:
     """Run the dashboard in a background thread. `live` is updated by the main loop;
     `setup` is an onboard.Setup serving the /setup page."""
 
@@ -177,6 +233,9 @@ def serve(port: int, events_path: str, live: dict, setup=None) -> None:
                 "/api/setup/unplugged": lambda b: setup.unplugged(),
                 "/api/setup/check": lambda b: setup.check(str(b.get("ip", ""))),
                 "/api/setup/save": setup.save}
+            if pause:
+                routes["/api/pause"] = lambda b: pause.set(b.get("hours"))
+                routes["/api/unpause"] = lambda b: pause.clear()
             if not (host_ok and self.headers.get("X-Setup") == "1" and self.path in routes):
                 self.send_error(403 if not host_ok or self.path in routes else 404)
                 return
