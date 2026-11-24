@@ -81,7 +81,7 @@ class DaemonTests(unittest.TestCase):
         t0 = time.time()
         t1 = self.wait_for(lambda: pstate(self.work.pid) == "T")
         self.assertLess(t1 - t0, 3.0, "halt should follow ~3 misses at 0.2 s")
-        self.assertTrue((self.d / "gpu" / "locked").exists())
+        self.wait_for(lambda: (self.d / "gpu" / "locked").exists())
         self.wait_for(lambda: "set power-saver" in self.profiles())  # runs after the halt
 
         # job launched mid-outage is frozen too
@@ -121,6 +121,7 @@ class DaemonTests(unittest.TestCase):
         self.start()
         self.sensor_up(False)
         self.wait_for(lambda: pstate(self.work.pid) == "T")
+        self.wait_for(lambda: (self.d / "gpu" / "locked").exists())
         self.daemon.send_signal(signal.SIGTERM)
         self.daemon.wait(timeout=5)
         self.assertEqual(pstate(self.work.pid), "S")
@@ -148,6 +149,35 @@ class DaemonTests(unittest.TestCase):
         self.sensor_up(True)                     # power returned while we were dead
         self.start()
         self.wait_for(lambda: pstate(self.work.pid) == "S")
+
+    def test_tcp_and_http_sensor_checks(self):
+        import http.server, socket, threading
+        sys.path.insert(0, str(ROOT))
+        import mains_watch as m
+        srv = http.server.HTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        try:
+            self.assertTrue(m.probe("127.0.0.1", f"tcp:{port}"))
+            self.assertTrue(m.probe("127.0.0.1", f"http://127.0.0.1:{port}/"))  # 501 still = alive
+        finally:
+            srv.shutdown(); srv.server_close()
+        self.assertFalse(m.probe("127.0.0.1", f"tcp:{port}"))
+        self.assertFalse(m.probe("127.0.0.1", f"http://127.0.0.1:{port}/"))
+        self.assertFalse(m.probe("127.0.0.1", "tcp:notaport"))
+
+    def test_config_file_overrides(self):
+        sys.path.insert(0, str(ROOT))
+        import mains_watch as m
+        conf = self.d / "c.conf"
+        conf.write_text("CHECK_EVERY=0.5\nGPU_CAP_WATTS=120  # lower\nSENSOR_CHECK=tcp:80\nHIBERNATE_AFTER=600\n")
+        saved = (m.CHECK_EVERY, m.GPU_CAP_WATTS, m.SENSOR_CHECK, m.HIBERNATE_AFTER)
+        try:
+            m.load_config(str(conf))
+            self.assertEqual((m.CHECK_EVERY, m.GPU_CAP_WATTS, m.SENSOR_CHECK, m.HIBERNATE_AFTER),
+                             (0.5, 120, "tcp:80", 600))
+        finally:
+            m.CHECK_EVERY, m.GPU_CAP_WATTS, m.SENSOR_CHECK, m.HIBERNATE_AFTER = saved
 
     def test_missing_sensor_ip_refuses_to_run(self):
         env = dict(os.environ, MAINS_WATCH_CONF=str(self.d / "none.conf"), SENSOR_IP="")

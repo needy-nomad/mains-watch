@@ -43,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 # ---- settings: defaults; override in /etc/mains-watch.conf (KEY=VALUE lines) or env
+SENSOR_CHECK = "ping"          # how the sensor is probed: ping | tcp:<port> | http://host/path
 SENSOR_IP = ""                 # Wi-Fi device on a non-UPS socket (DHCP-reserved). Required.
 ROUTER_IP = ""                 # router / gateway on backup power; "" = default gateway
 CHECK_EVERY = 1.0              # seconds between checks
@@ -71,6 +72,29 @@ def ping(ip: str) -> bool:
         return result.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
         return False
+
+
+def probe(ip: str, method: str) -> bool:
+    """Is the sensor alive? method: 'ping', 'tcp:<port>' or an http(s):// URL (any reply counts)."""
+    method = method.strip()
+    if method.startswith("tcp:"):
+        import socket
+        try:
+            with socket.create_connection((ip, int(method[4:])), timeout=1):
+                return True
+        except (OSError, ValueError):
+            return False
+    if method.startswith(("http://", "https://")):
+        import urllib.error
+        import urllib.request
+        try:
+            urllib.request.urlopen(method, timeout=1).close()
+            return True
+        except urllib.error.HTTPError:
+            return True                         # the device answered, just not with 200
+        except (OSError, ValueError):
+            return False
+    return ping(ip)
 
 
 def run(cmd: list) -> None:
@@ -157,7 +181,7 @@ def load_config(path: str) -> None:
         pass
     g = globals()
     for key in ("SENSOR_IP", "ROUTER_IP", "CHECK_EVERY", "OUTAGE_CONFIRM", "RESTORE_CONFIRM",
-                "HIBERNATE_AFTER", "GPU_CAP_WATTS", "GPU_LOCK_MHZ", "STATE_FILE", "LOG_FILE"):
+                "HIBERNATE_AFTER", "SENSOR_CHECK", "GPU_CAP_WATTS", "GPU_LOCK_MHZ", "STATE_FILE", "LOG_FILE"):
         raw = os.environ.get(key, values.get(key))
         if raw is None:
             continue
@@ -245,7 +269,7 @@ def main() -> None:
     while True:
         started = time.monotonic()
         # Ping both at once so a miss costs one timeout, not two.
-        f_sensor, f_router = pool.submit(ping, SENSOR_IP), pool.submit(ping, router_ip)
+        f_sensor, f_router = pool.submit(probe, SENSOR_IP, SENSOR_CHECK), pool.submit(ping, router_ip)
         sensor_ok = f_sensor.result()
         router_ok = True if sensor_ok else f_router.result()
 

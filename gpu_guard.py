@@ -147,9 +147,12 @@ class GpuGuard:
         if not self.clock_locked and not self._lock_tried:
             self._lock_tried = True
             mhz = self._min_clock()
-            if mhz and self._smi("-lgc", f"{mhz},{mhz}") is not None:
-                self.clock_locked = True
-                log.info("graphics clock locked to %d MHz", mhz)
+            if mhz:
+                self.clock_locked = True            # set first: a SIGTERM mid-call must still unlock
+                if self._smi("-lgc", f"{mhz},{mhz}") is None:
+                    self.clock_locked = False
+                else:
+                    log.info("graphics clock locked to %d MHz", mhz)
         self._save_state()
         log.info("GPU halted (%d newly stopped, %d total frozen)", n, len(self.stopped))
 
