@@ -4,32 +4,12 @@ device disappears when it is unplugged, then writes the config and restarts the 
 
 import ipaddress
 import re
-import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-
-def ping(ip: str) -> bool:
-    return subprocess.run(["ping", "-c", "1", "-W", "1", ip], stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL).returncode == 0
-
-
-def local_network():
-    """(gateway, own_ip, /24 network) from the default route, or None."""
-    route = subprocess.run(["ip", "-4", "route", "show", "default"],
-                           capture_output=True, text=True).stdout.split()
-    if "via" not in route or "dev" not in route:
-        return None
-    gateway, dev = route[route.index("via") + 1], route[route.index("dev") + 1]
-    addr = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", dev],
-                          capture_output=True, text=True).stdout
-    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", addr)
-    if not m:
-        return None
-    own = m.group(1)
-    return gateway, own, ipaddress.ip_network(f"{own}/24", strict=False)
+from netutil import local_network, ping  # noqa: F401  (re-exported for callers/tests)
 
 
 def scan(network, ping_fn=ping) -> set:

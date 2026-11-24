@@ -119,6 +119,8 @@ table{width:100%;border-collapse:collapse}td{padding:.3rem .2rem;border-top:1px 
 <div><div class=n id=gpu>-</div><div class=l>GPU power now (cap <span id=cap></span> W)</div></div>
 <div><div class=n id=frozen>-</div><div class=l>GPU jobs frozen</div></div>
 </div>
+<div class=card><b>Will it work after a restart?</b>
+<button onclick=runCheck()>Run restart check</button><div id=verdict style="margin:.6rem 0;font-weight:700"></div><table id=checks></table></div>
 <div class=card><b>History</b><table id=hist></table></div>
 <script>
 const dur=s=>s<60?Math.round(s)+' s':s<3600?Math.round(s/60)+' min':(s/3600).toFixed(1)+' h';
@@ -139,6 +141,12 @@ async function tick(){try{
  $('hist').innerHTML=d.recent.map(e=>'<tr><td>'+new Date(e.t*1000).toLocaleString()+'</td><td>'+
   (e.event=='paused'?'protection paused':e.event=='unpaused'?'protection turned back on':e.event=='lost'?'power lost':e.event=='restored'?'power back (cut lasted '+dur(e.duration_s)+')':e.event)+'</td></tr>').join('');
 }catch(e){$('state').textContent='service not reachable';$('state').className='bad'}}
+async function runCheck(){$('verdict').textContent='Checking...';
+ try{const v=await (await fetch('/api/check')).json();
+  $('verdict').textContent=v.restart_proof?'Yes - it will start by itself after a restart.':'NOT restart-proof: '+v.failed.join(', ');
+  $('verdict').className=v.restart_proof?'ok':'bad';
+  $('checks').innerHTML=v.checks.map(c=>'<tr><td>'+({ok:'OK',warn:'warn',fail:'FAIL'}[c.status])+'</td><td>'+c.name+'</td><td class=l>'+c.detail+'</td></tr>').join('')
+ }catch(e){$('verdict').textContent='check failed'}}
 tick();setInterval(tick,2000);
 </script>"""
 
@@ -204,7 +212,7 @@ $('save').onclick=async()=>{busy($('save'),$('m4'),'Saving...');
 </script>"""
 
 
-def serve(port: int, events_path: str, live: dict, setup=None, pause=None) -> None:
+def serve(port: int, events_path: str, live: dict, setup=None, pause=None, check=None) -> None:
     """Run the dashboard in a background thread. `live` is updated by the main loop;
     `setup` is an onboard.Setup serving the /setup page."""
 
@@ -217,6 +225,8 @@ def serve(port: int, events_path: str, live: dict, setup=None, pause=None) -> No
                 body, ctype = PAGE, "text/html; charset=utf-8"
             elif self.path == "/setup" and setup:
                 body, ctype = SETUP_PAGE, "text/html; charset=utf-8"
+            elif self.path == "/api/check" and check:
+                body, ctype = json.dumps(check()), "application/json"
             elif self.path == "/api/setup/config" and setup:
                 body, ctype = json.dumps(setup.config()), "application/json"
             else:

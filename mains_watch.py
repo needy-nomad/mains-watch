@@ -38,6 +38,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -52,29 +53,27 @@ RESTORE_CONFIRM = 2            # sensor answers in a row before "mains back"
 HIBERNATE_AFTER = None         # seconds on battery before hibernating; None = never
 GPU_CAP_WATTS = 150            # GPU draw that must not be exceeded while on battery
 GPU_LOCK_MHZ = None            # graphics clock while halted; None = lowest supported
-STATE_FILE = "/run/mains-watch/state.json"
-PAUSE_FILE = "/var/lib/mains-watch/pause.json"      # present while protection is paused
-EVENTS_FILE = "/var/lib/mains-watch/events.jsonl"   # outage history (survives reboots)
+GPU_POLL_EVERY = 10.0          # seconds between GPU power readings (dashboard / cap check)
+if platform.system() == "Windows":
+    _DATA = os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "mains-watch")
+    STATE_FILE = os.path.join(_DATA, "state.json")
+    PAUSE_FILE = os.path.join(_DATA, "pause.json")
+    EVENTS_FILE = os.path.join(_DATA, "events.jsonl")
+    _DEFAULT_CONF = os.path.join(_DATA, "mains-watch.conf")
+else:
+    STATE_FILE = "/run/mains-watch/state.json"
+    PAUSE_FILE = "/var/lib/mains-watch/pause.json"      # present while protection is paused
+    EVENTS_FILE = "/var/lib/mains-watch/events.jsonl"   # outage history (survives reboots)
+    _DEFAULT_CONF = "/etc/mains-watch.conf"
 DASHBOARD_PORT = 8099          # http://127.0.0.1:<port>; 0 = no dashboard
-CONFIG_FILE = os.environ.get("MAINS_WATCH_CONF", "/etc/mains-watch.conf")
+CONFIG_FILE = os.environ.get("MAINS_WATCH_CONF", _DEFAULT_CONF)
 LOG_FILE = None                # extra log file; journald already captures stdout
 # -------------------------------------------------------------------------------
 
 IS_WINDOWS = platform.system() == "Windows"
+EXIT = threading.Event()        # set to leave the main loop cleanly (setup page uses it to restart)
 
-
-def ping(ip: str) -> bool:
-    """One ICMP ping with a short timeout. True if the host replied."""
-    if IS_WINDOWS:
-        cmd = ["ping", "-n", "1", "-w", "1000", ip]
-    else:
-        cmd = ["ping", "-c", "1", "-W", "1", ip]
-    try:
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=4)
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        return False
+from netutil import default_gateway, ping  # noqa: E402
 
 
 def probe(ip: str, method: str) -> bool:
@@ -184,7 +183,7 @@ def load_config(path: str) -> None:
         pass
     g = globals()
     for key in ("SENSOR_IP", "ROUTER_IP", "CHECK_EVERY", "OUTAGE_CONFIRM", "RESTORE_CONFIRM",
-                "HIBERNATE_AFTER", "SENSOR_CHECK", "GPU_CAP_WATTS", "GPU_LOCK_MHZ", "STATE_FILE", "PAUSE_FILE", "EVENTS_FILE", "DASHBOARD_PORT", "LOG_FILE"):
+                "HIBERNATE_AFTER", "SENSOR_CHECK", "GPU_CAP_WATTS", "GPU_LOCK_MHZ", "GPU_POLL_EVERY", "STATE_FILE", "PAUSE_FILE", "EVENTS_FILE", "DASHBOARD_PORT", "LOG_FILE"):
         raw = os.environ.get(key, values.get(key))
         if raw is None:
             continue
@@ -199,54 +198,54 @@ def load_config(path: str) -> None:
             g[key] = int(raw)
 
 
-def default_gateway() -> str:
-    try:
-        out = subprocess.run(["ip", "route", "show", "default"], capture_output=True,
-                             text=True, timeout=5).stdout.split()
-        return out[out.index("via") + 1]
-    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
-        return ""
-
-
 def main() -> None:
+    if "--check" in sys.argv:
+        import selfcheck
+        sys.exit(selfcheck.cli(CONFIG_FILE))
     load_config(CONFIG_FILE)
-    handlers = [logging.StreamHandler()]
+    if "--release" in sys.argv:                 # unfreeze whatever a dead watcher left frozen
+        from gpu_guard import GpuGuard
+        GpuGuard(STATE_FILE).resume()
+        return
+    handlers = [logging.StreamHandler()] if sys.stderr is not None else []   # pythonw has no console
     if LOG_FILE:
+        os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
         handlers.append(logging.FileHandler(LOG_FILE))
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
     from dashboard import Pause, record, serve
-    pause = Pause(PAUSE_FILE)
+    from gpu_guard import GpuGuard, privileged
     from onboard import Setup
+    import selfcheck
+    pause = Pause(PAUSE_FILE)
     live = {"setup_needed": not SENSOR_IP, "on_battery": False, "since": None, "sensor": SENSOR_IP,
             "cap_watts": GPU_CAP_WATTS, "gpu_watts": None, "frozen": 0,
             "paused": False, "paused_until": None}
-    setup = Setup(CONFIG_FILE, restart=lambda: os.kill(os.getpid(), signal.SIGTERM))
+    setup = Setup(CONFIG_FILE, restart=EXIT.set)
+    router_ip = ROUTER_IP or default_gateway()
+    cfg = dict(conf=CONFIG_FILE, sensor=SENSOR_IP, sensor_check=SENSOR_CHECK, router=router_ip,
+               pause_file=PAUSE_FILE, events_file=EVENTS_FILE, state_file=STATE_FILE)
     if DASHBOARD_PORT:
         try:
-            serve(DASHBOARD_PORT, EVENTS_FILE, live, setup, pause)
+            serve(DASHBOARD_PORT, EVENTS_FILE, live, setup, pause, lambda: selfcheck.verdict(selfcheck.run(cfg, probe, ping)))
         except OSError as exc:
             logging.warning("dashboard not started: %s", exc)
     if not SENSOR_IP:
         if not DASHBOARD_PORT:
             sys.exit("SENSOR_IP is not set (edit %s)" % CONFIG_FILE)
         logging.warning("SENSOR_IP not set: open http://127.0.0.1:%d to finish setup", DASHBOARD_PORT)
-        while True:                             # setup page restarts us once it saves the config
-            time.sleep(3600)
-    router_ip = ROUTER_IP or default_gateway()
+        EXIT.wait()                             # the setup page sets EXIT after saving the config
+        sys.exit(3)                             # non-zero: the service manager starts us again
     if not router_ip:
         sys.exit("ROUTER_IP is not set and no default gateway found")
 
-    gpu = None
-    if not IS_WINDOWS:
-        from gpu_guard import GpuGuard
-        gpu = GpuGuard(STATE_FILE, cap_watts=GPU_CAP_WATTS, lock_mhz=GPU_LOCK_MHZ)
-        if not gpu.available():
-            logging.warning("nvidia-smi not found; GPU control disabled")
-            gpu = None
-        elif os.geteuid() != 0:
-            logging.warning("not running as root: cannot freeze other users' GPU "
-                            "processes or lock clocks")
+    gpu = GpuGuard(STATE_FILE, cap_watts=GPU_CAP_WATTS, lock_mhz=GPU_LOCK_MHZ)
+    if not gpu.available():
+        logging.warning("nvidia-smi not found; GPU control disabled")
+        gpu = None
+    elif not privileged():
+        logging.warning("not running as root/administrator: cannot freeze other users' GPU "
+                        "processes or lock clocks")
 
     now = time.monotonic()
     # A restart in the middle of an outage must not wake the GPU up.
@@ -277,23 +276,30 @@ def main() -> None:
         "HIBERNATE": ("Mains off too long: hibernating", hibernate),
     }
 
-    def shutdown(signum, _frame) -> None:
+    def leave(code: int) -> None:
         # Never leave processes frozen behind a dead watcher.
-        logging.info("Signal %s: releasing GPU and exiting", signum)
         if gpu:
             gpu.resume()
-        sys.exit(0)
+        sys.exit(code)
 
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+    def on_signal(signum, _frame) -> None:
+        logging.info("Signal %s: releasing GPU and exiting", signum)
+        leave(0)
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
 
     if gpu and not watcher.on_battery and gpu.halted:
         gpu.resume()                            # stale state with nothing to hold it
 
     pool = ThreadPoolExecutor(max_workers=2)
     was_paused = False
+    last_power = 0.0                            # when the GPU power was last read (monotonic)
     while True:
         started = time.monotonic()
+        if EXIT.is_set():
+            logging.info("Restart requested (settings saved)")
+            leave(3)
         until = pause.until()
         if until is not None:                   # user switched protection off: do nothing
             if not was_paused:
@@ -305,7 +311,7 @@ def main() -> None:
                 watcher = Watcher()
             live.update(paused=True, paused_until=None if until == float("inf") else until,
                         on_battery=False, since=None)
-            time.sleep(max(0.0, CHECK_EVERY - (time.monotonic() - started)))
+            EXIT.wait(max(0.0, CHECK_EVERY - (time.monotonic() - started)))
             continue
         if was_paused:
             logging.info("Protection back on")
@@ -322,17 +328,19 @@ def main() -> None:
             message, do_it = actions[action]
             logging.info(message)
             do_it()
-        elif watcher.on_battery and gpu:
-            w = gpu.enforce()                   # catch jobs started during the outage
-            live["gpu_watts"] = w
-            if w is not None and int(time.monotonic()) % 30 == 0:
-                logging.info("on battery, GPU %.0f W", w)
-
         if gpu:
+            read_power = time.monotonic() - last_power >= GPU_POLL_EVERY
+            if watcher.on_battery and not action:
+                w = gpu.enforce(read_power)     # every cycle: freeze jobs started during the outage
+            else:
+                w = gpu.power_draw() if read_power else None
+            if read_power:
+                last_power = time.monotonic()
+                live["gpu_watts"] = w
+                if watcher.on_battery and w is not None:
+                    logging.info("on battery, GPU %.0f W", w)
             live["frozen"] = len(gpu.stopped)
-            if not watcher.on_battery:
-                live["gpu_watts"] = gpu.power_draw()
-        time.sleep(max(0.0, CHECK_EVERY - (time.monotonic() - started)))
+        EXIT.wait(max(0.0, CHECK_EVERY - (time.monotonic() - started)))
 
 
 if __name__ == "__main__":

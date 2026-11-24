@@ -55,7 +55,7 @@ class DaemonTests(unittest.TestCase):
                    FAKE_GPU_DIR=str(self.d / "gpu"), FAKE_NET_DIR=str(self.d / "net"),
                    MAINS_WATCH_CONF=str(self.d / "none.conf"), SENSOR_IP=SENSOR,
                    ROUTER_IP=ROUTER, CHECK_EVERY="0.2", STATE_FILE=str(self.d / "state.json"),
-                   EVENTS_FILE=str(self.d / "events.jsonl"), PAUSE_FILE=str(self.d / "pause.json"), DASHBOARD_PORT=str(self.port))
+                   EVENTS_FILE=str(self.d / "events.jsonl"), PAUSE_FILE=str(self.d / "pause.json"), GPU_POLL_EVERY="10", DASHBOARD_PORT=str(self.port))
         self.daemon = subprocess.Popen([sys.executable, str(ROOT / "mains_watch.py")], env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
@@ -170,6 +170,19 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(pstate(self.work.pid), "S")
         self.assertGreater(self.api()["paused_until"], time.time())
 
+    def test_gpu_power_is_read_at_the_poll_interval_not_every_cycle(self):
+        calls = self.d / "gpu" / "calls.log"
+        self.start()                                           # CHECK_EVERY=0.2, GPU_POLL_EVERY=10
+        time.sleep(3.0)                                        # ~15 cycles
+        self.assertLessEqual(calls.read_text().count("power.draw"), 1)
+        self.assertEqual(self.api()["gpu_watts"], 30.0)
+        self.sensor_up(False)                                  # on battery: sweeps still every cycle
+        self.wait_for(lambda: pstate(self.work.pid) == "T")
+        before = calls.read_text().count("compute-apps")
+        time.sleep(1.0)
+        self.assertGreaterEqual(calls.read_text().count("compute-apps") - before, 3)
+        self.assertLessEqual(calls.read_text().count("power.draw"), 2)
+
     def test_router_down_too_is_not_an_outage(self):
         self.start()
         self.sensor_up(False)
@@ -251,8 +264,10 @@ class DaemonTests(unittest.TestCase):
     def test_first_run_without_sensor_serves_setup_and_stays_up(self):
         import onboard
         info = onboard.local_network()
-        if not info or str(info[2]) != "192.168.1.0/24":
-            self.skipTest("test fakes devices on 192.168.1.0/24")
+        if not info:
+            self.skipTest("needs a network connection to derive the local subnet")
+        prefix = str(info[2]).rsplit(".", 1)[0]                 # e.g. "10.0.0"
+        router, sensor = f"{info[0]}", f"{prefix}.{254 if not info[1].endswith('.254') else 253}"
         env = dict(os.environ, PATH=f"{HERE / 'fakebin'}:{os.environ['PATH']}",
                    FAKE_NET_DIR=str(self.d / "net"), MAINS_WATCH_CONF=str(self.d / "new.conf"),
                    SENSOR_IP="", DASHBOARD_PORT=str(self.port), EVENTS_FILE=str(self.d / "e.jsonl"),
@@ -270,15 +285,15 @@ class DaemonTests(unittest.TestCase):
                                         {"X-Setup": "1", "Content-Type": "application/json"})
             return json.load(urllib.request.urlopen(rq, timeout=60))
         net = self.d / "net"
-        (net / "192.168.1.1").write_text("")                  # router (ignored by the scan)
-        (net / "192.168.1.77").write_text("")                 # the sensor
-        self.assertIn("192.168.1.77", post("/api/setup/scan", {})["found"])
-        (net / "192.168.1.77").unlink()                       # unplug
-        self.assertEqual(post("/api/setup/unplugged", {})["gone"], ["192.168.1.77"])
-        self.assertEqual(post("/api/setup/save", {"sensor": "192.168.1.77", "cap": 140,
+        (net / router).write_text("")                  # router (ignored by the scan)
+        (net / sensor).write_text("")                 # the sensor
+        self.assertIn(sensor, post("/api/setup/scan", {})["found"])
+        (net / sensor).unlink()                       # unplug
+        self.assertEqual(post("/api/setup/unplugged", {})["gone"], [sensor])
+        self.assertEqual(post("/api/setup/save", {"sensor": sensor, "cap": 140,
                                                   "every": 1, "confirm": 3}), {"ok": True})
         self.daemon.wait(timeout=10)                          # exits so systemd restarts it
-        self.assertIn("SENSOR_IP=192.168.1.77", (self.d / "new.conf").read_text())
+        self.assertIn(f"SENSOR_IP={sensor}", (self.d / "new.conf").read_text())
 
     def test_pause_unit(self):
         from dashboard import Pause
