@@ -63,7 +63,8 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(s.save({"sensor": "10.0.0.50", "cap": "120", "every": "2", "confirm": "4"}),
                          {"ok": True})
         self.assertEqual(s.config(), {"SENSOR_IP": "10.0.0.50", "GPU_CAP_WATTS": "120.0",
-                                      "CHECK_EVERY": "2.0", "OUTAGE_CONFIRM": "4"})
+                                      "CHECK_EVERY": "2.0", "OUTAGE_CONFIRM": "4",
+                                  "RESTORE_CONFIRM": "2", "GPU_POLL_EVERY": "10.0"})
         import time; time.sleep(1.3)
         self.assertEqual(restarted, [1])                 # service asked to restart
 

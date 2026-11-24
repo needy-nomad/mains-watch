@@ -91,14 +91,17 @@ class Setup:
         try:
             sensor = str(data["sensor"]).strip()
             cap, every, confirm = float(data["cap"]), float(data["every"]), int(data["confirm"])
+            restore, poll = int(data.get("restore", 2)), float(data.get("poll", 10))
         except (KeyError, ValueError, TypeError):
             return {"error": "Invalid values."}
         if not self._valid_ip(sensor) or sensor in self._ignore():
             return {"error": "Sensor must be a valid IPv4 address, not the router or this PC."}
-        if not (50 <= cap <= 600 and 0.2 <= every <= 60 and 1 <= confirm <= 20):
-            return {"error": "Out of range: cap 50-600 W, interval 0.2-60 s, misses 1-20."}
+        if not (50 <= cap <= 600 and 0.2 <= every <= 60 and 1 <= confirm <= 20
+                and 1 <= restore <= 20 and 1 <= poll <= 300):
+            return {"error": "Out of range: cap 50-600 W, interval 0.2-60 s, misses 1-20, GPU reading 1-300 s."}
         for key, value in (("SENSOR_IP", sensor), ("GPU_CAP_WATTS", cap), ("CHECK_EVERY", every),
-                           ("OUTAGE_CONFIRM", confirm)):
+                           ("OUTAGE_CONFIRM", confirm), ("RESTORE_CONFIRM", restore),
+                           ("GPU_POLL_EVERY", poll)):
             set_key(self.conf, key, value)
         threading.Timer(1.0, self.restart).start()  # systemd brings us back with the new config
         return {"ok": True}

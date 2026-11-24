@@ -171,10 +171,12 @@ label{display:block;margin:.5rem 0}.err{color:#f87171}.ok{color:#4ade80}.hide{di
 <button id=unp>I have unplugged it</button><div id=m2 class=l></div><div id=pick></div></div>
 <div class="card hide" id=s3><h2>3. Plug it back in</h2>
 <p>Sensor: <b id=ip></b></p><button id=back>I have plugged it back in</button><div id=m3 class=l></div></div>
-<div class="card hide" id=s4><h2>4. Settings</h2>
+<div class="card hide" id=s4><h2 id=h4>4. Settings</h2>
 <label>GPU power cap while on battery (W) <input id=cap type=number value=150></label>
 <label>Seconds between checks <input id=every type=number step=0.1 value=1></label>
 <label>Missed checks before a power cut is declared <input id=confirm type=number value=3></label>
+<label>Good checks before power is considered back <input id=restore type=number value=2></label>
+<label>Seconds between GPU power readings <input id=poll type=number step=1 value=10></label>
 <button id=save>Save and start</button><div id=m4 class=l></div></div>
 <script>
 const $=i=>document.getElementById(i);let sensor='';
@@ -182,7 +184,9 @@ const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/js
 const busy=(b,m,t)=>{b.disabled=true;m.className='l';m.textContent=t};
 const fail=(b,m,t)=>{b.disabled=false;m.className='err';m.textContent=t};
 fetch('/api/setup/config').then(r=>r.json()).then(c=>{if(c.GPU_CAP_WATTS)$('cap').value=c.GPU_CAP_WATTS;
- if(c.CHECK_EVERY)$('every').value=c.CHECK_EVERY;if(c.OUTAGE_CONFIRM)$('confirm').value=c.OUTAGE_CONFIRM});
+ if(c.CHECK_EVERY)$('every').value=c.CHECK_EVERY;if(c.OUTAGE_CONFIRM)$('confirm').value=c.OUTAGE_CONFIRM;
+ if(c.RESTORE_CONFIRM)$('restore').value=c.RESTORE_CONFIRM;if(c.GPU_POLL_EVERY)$('poll').value=c.GPU_POLL_EVERY;
+ if(c.SENSOR_IP){sensor=c.SENSOR_IP;$('h4').textContent='Settings (sensor '+sensor+')';$('s4').classList.remove('hide');$('save').textContent='Save settings'}});
 $('scan').onclick=async()=>{busy($('scan'),$('m1'),'Scanning, about 10 seconds...');
  const r=await post('/api/setup/scan');if(r.error)return fail($('scan'),$('m1'),r.error);
  $('m1').className='l ok';$('m1').textContent='Found '+r.found.length+' devices. Router: '+r.router;
@@ -203,7 +207,7 @@ $('back').onclick=async()=>{busy($('back'),$('m3'),'Checking...');
    $('s4').classList.remove('hide');return}await new Promise(r=>setTimeout(r,2000))}
  fail($('back'),$('m3'),'Not back yet. Check it is plugged in and try again.')};
 $('save').onclick=async()=>{busy($('save'),$('m4'),'Saving...');
- const r=await post('/api/setup/save',{sensor,cap:$('cap').value,every:$('every').value,confirm:$('confirm').value});
+ const r=await post('/api/setup/save',{sensor,cap:$('cap').value,every:$('every').value,confirm:$('confirm').value,restore:$('restore').value,poll:$('poll').value});
  if(r.error)return fail($('save'),$('m4'),r.error);
  $('m4').className='l ok';$('m4').textContent='Saved. Restarting the service...';
  for(let i=0;i<30;i++){await new Promise(r=>setTimeout(r,1000));
