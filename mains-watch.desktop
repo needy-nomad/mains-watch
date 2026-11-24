@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Mains Watch
+Comment=Power-cut status and history
+Exec=xdg-open http://127.0.0.1:8099
+Icon=battery
+Categories=System;Monitor;

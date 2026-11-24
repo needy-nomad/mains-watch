@@ -53,6 +53,8 @@ HIBERNATE_AFTER = None         # seconds on battery before hibernating; None = n
 GPU_CAP_WATTS = 150            # GPU draw that must not be exceeded while on battery
 GPU_LOCK_MHZ = None            # graphics clock while halted; None = lowest supported
 STATE_FILE = "/run/mains-watch/state.json"
+EVENTS_FILE = "/var/lib/mains-watch/events.jsonl"   # outage history (survives reboots)
+DASHBOARD_PORT = 8099          # http://127.0.0.1:<port>; 0 = no dashboard
 CONFIG_FILE = os.environ.get("MAINS_WATCH_CONF", "/etc/mains-watch.conf")
 LOG_FILE = None                # extra log file; journald already captures stdout
 # -------------------------------------------------------------------------------
@@ -181,7 +183,7 @@ def load_config(path: str) -> None:
         pass
     g = globals()
     for key in ("SENSOR_IP", "ROUTER_IP", "CHECK_EVERY", "OUTAGE_CONFIRM", "RESTORE_CONFIRM",
-                "HIBERNATE_AFTER", "SENSOR_CHECK", "GPU_CAP_WATTS", "GPU_LOCK_MHZ", "STATE_FILE", "LOG_FILE"):
+                "HIBERNATE_AFTER", "SENSOR_CHECK", "GPU_CAP_WATTS", "GPU_LOCK_MHZ", "STATE_FILE", "EVENTS_FILE", "DASHBOARD_PORT", "LOG_FILE"):
         raw = os.environ.get(key, values.get(key))
         if raw is None:
             continue
@@ -236,12 +238,25 @@ def main() -> None:
                  SENSOR_IP, router_ip, platform.system(), "on" if gpu else "off",
                  ", resuming in halted state" if watcher.on_battery else "")
 
+    from dashboard import record, serve
+    live = {"on_battery": watcher.on_battery, "since": time.time() if watcher.on_battery else None,
+            "sensor": SENSOR_IP, "cap_watts": GPU_CAP_WATTS, "gpu_watts": None, "frozen": 0}
+    if DASHBOARD_PORT:
+        try:
+            serve(DASHBOARD_PORT, EVENTS_FILE, live)
+        except OSError as exc:
+            logging.warning("dashboard not started: %s", exc)
+
     def power_saver() -> None:
+        live.update(on_battery=True, since=time.time())
+        record(EVENTS_FILE, "lost")
         if gpu:
             gpu.halt()                          # first: this is the urgent part
         set_power_saver()
 
     def normal() -> None:
+        record(EVENTS_FILE, "restored", duration_s=round(time.time() - (live["since"] or time.time())))
+        live.update(on_battery=False, since=None)
         if gpu:
             gpu.resume()
         set_normal()
@@ -280,9 +295,14 @@ def main() -> None:
             do_it()
         elif watcher.on_battery and gpu:
             w = gpu.enforce()                   # catch jobs started during the outage
+            live["gpu_watts"] = w
             if w is not None and int(time.monotonic()) % 30 == 0:
                 logging.info("on battery, GPU %.0f W", w)
 
+        if gpu:
+            live["frozen"] = len(gpu.stopped)
+            if not watcher.on_battery:
+                live["gpu_watts"] = gpu.power_draw()
         time.sleep(max(0.0, CHECK_EVERY - (time.monotonic() - started)))
 
 

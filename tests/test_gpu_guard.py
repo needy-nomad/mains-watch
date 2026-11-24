@@ -14,8 +14,9 @@ FAKE = str(HERE / "fakebin" / "nvidia-smi")
 
 
 def state(pid):
+    """'T' stopped, 'S' running/sleeping (a just-continued process shows R or S)."""
     st = _proc_stat(pid)
-    return st[0] if st else None
+    return None if st is None else ("S" if st[0] in "RS" else st[0])
 
 
 class GuardTests(unittest.TestCase):

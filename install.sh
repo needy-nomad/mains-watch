@@ -12,6 +12,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     systemctl disable --now mains-watch.service 2>/dev/null || true
     rm -f /etc/systemd/system/mains-watch.service
     rm -rf /opt/mains-watch
+    rm -f /usr/share/applications/mains-watch.desktop
     systemctl daemon-reload
     echo "removed (config $CONF kept)"
     exit 0
@@ -28,8 +29,9 @@ fi
 grep -q '^SENSOR_IP=.\+' "$CONF" 2>/dev/null || { echo "give the sensor IP: sudo $0 <SENSOR_IP>" >&2; exit 1; }
 
 install -d /opt/mains-watch
-install -m 755 "$HERE/mains_watch.py" "$HERE/gpu_guard.py" /opt/mains-watch/
+install -m 755 "$HERE/mains_watch.py" "$HERE/gpu_guard.py" "$HERE/dashboard.py" /opt/mains-watch/
 install -m 644 "$HERE/mains-watch.service" /etc/systemd/system/mains-watch.service
+install -m 644 "$HERE/mains-watch.desktop" /usr/share/applications/mains-watch.desktop
 systemctl daemon-reload
 systemctl enable mains-watch.service
 systemctl restart mains-watch.service

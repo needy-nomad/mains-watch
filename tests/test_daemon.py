@@ -2,7 +2,10 @@
 simulate an outage and a restore. Run with: python3 -m unittest discover -s tests"""
 import os
 import pathlib
+import json
 import signal
+import socket
+import urllib.request
 import subprocess
 import sys
 import tempfile
@@ -19,7 +22,7 @@ SENSOR, ROUTER = "10.9.9.100", "10.9.9.1"
 
 def pstate(pid):
     st = _proc_stat(pid)
-    return st[0] if st else None
+    return None if st is None else ("S" if st[0] in "RS" else st[0])
 
 
 class DaemonTests(unittest.TestCase):
@@ -33,6 +36,9 @@ class DaemonTests(unittest.TestCase):
         self.work = subprocess.Popen(["sleep", "600"])      # stand-in CUDA job
         (self.d / "gpu" / "pids").write_text(str(self.work.pid))
         self.daemon = None
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
 
     def tearDown(self):
         if self.daemon and self.daemon.poll() is None:
@@ -48,7 +54,8 @@ class DaemonTests(unittest.TestCase):
         env = dict(os.environ, PATH=f"{HERE / 'fakebin'}:{os.environ['PATH']}",
                    FAKE_GPU_DIR=str(self.d / "gpu"), FAKE_NET_DIR=str(self.d / "net"),
                    MAINS_WATCH_CONF=str(self.d / "none.conf"), SENSOR_IP=SENSOR,
-                   ROUTER_IP=ROUTER, CHECK_EVERY="0.2", STATE_FILE=str(self.d / "state.json"))
+                   ROUTER_IP=ROUTER, CHECK_EVERY="0.2", STATE_FILE=str(self.d / "state.json"),
+                   EVENTS_FILE=str(self.d / "events.jsonl"), DASHBOARD_PORT=str(self.port))
         self.daemon = subprocess.Popen([sys.executable, str(ROOT / "mains_watch.py")], env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
@@ -59,8 +66,11 @@ class DaemonTests(unittest.TestCase):
     def wait_for(self, cond, timeout=8.0):
         end = time.time() + timeout
         while time.time() < end:
-            if cond():
-                return time.time()
+            try:
+                if cond():
+                    return time.time()
+            except OSError:                       # dashboard not listening yet
+                pass
             time.sleep(0.05)
         self.fail("condition not met; daemon log:\n" + self._log())
 
@@ -100,6 +110,26 @@ class DaemonTests(unittest.TestCase):
         finally:
             late.kill()
             late.wait()
+
+    def api(self):
+        return json.load(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/api/status", timeout=2))
+
+    def test_dashboard_counts_outages(self):
+        self.start()
+        self.wait_for(lambda: self.api().get("outages_total") == 0)
+        self.assertFalse(self.api()["on_battery"])
+        for n in (1, 2):
+            self.sensor_up(False)
+            self.wait_for(lambda: self.api()["on_battery"])
+            self.wait_for(lambda: self.api()["frozen"] == 1)
+            self.sensor_up(True)
+            self.wait_for(lambda: not self.api()["on_battery"] and self.api()["outages_total"] == n)
+            self.wait_for(lambda: self.api()["frozen"] == 0)
+        d = self.api()
+        self.assertEqual((d["outages_total"], d["outages_today"]), (2, 2))
+        self.assertEqual([e["event"] for e in d["recent"]], ["restored", "lost", "restored", "lost"])
+        page = urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=2).read()
+        self.assertIn(b"Mains watch", page)
 
     def test_router_down_too_is_not_an_outage(self):
         self.start()
