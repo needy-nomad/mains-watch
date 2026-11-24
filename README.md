@@ -68,4 +68,4 @@ To test against real hardware, unplug the sensor and watch the log for `Mains lo
 
 ## License
 
-No license has been chosen yet. All rights are reserved by default until one is added.
+Released under the MIT License. See [LICENSE](LICENSE).
