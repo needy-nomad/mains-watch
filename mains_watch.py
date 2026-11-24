@@ -214,8 +214,22 @@ def main() -> None:
         handlers.append(logging.FileHandler(LOG_FILE))
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
+    from dashboard import record, serve
+    from onboard import Setup
+    live = {"setup_needed": not SENSOR_IP, "on_battery": False, "since": None, "sensor": SENSOR_IP,
+            "cap_watts": GPU_CAP_WATTS, "gpu_watts": None, "frozen": 0}
+    setup = Setup(CONFIG_FILE, restart=lambda: os.kill(os.getpid(), signal.SIGTERM))
+    if DASHBOARD_PORT:
+        try:
+            serve(DASHBOARD_PORT, EVENTS_FILE, live, setup)
+        except OSError as exc:
+            logging.warning("dashboard not started: %s", exc)
     if not SENSOR_IP:
-        sys.exit("SENSOR_IP is not set (edit %s)" % CONFIG_FILE)
+        if not DASHBOARD_PORT:
+            sys.exit("SENSOR_IP is not set (edit %s)" % CONFIG_FILE)
+        logging.warning("SENSOR_IP not set: open http://127.0.0.1:%d to finish setup", DASHBOARD_PORT)
+        while True:                             # setup page restarts us once it saves the config
+            time.sleep(3600)
     router_ip = ROUTER_IP or default_gateway()
     if not router_ip:
         sys.exit("ROUTER_IP is not set and no default gateway found")
@@ -238,14 +252,7 @@ def main() -> None:
                  SENSOR_IP, router_ip, platform.system(), "on" if gpu else "off",
                  ", resuming in halted state" if watcher.on_battery else "")
 
-    from dashboard import record, serve
-    live = {"on_battery": watcher.on_battery, "since": time.time() if watcher.on_battery else None,
-            "sensor": SENSOR_IP, "cap_watts": GPU_CAP_WATTS, "gpu_watts": None, "frozen": 0}
-    if DASHBOARD_PORT:
-        try:
-            serve(DASHBOARD_PORT, EVENTS_FILE, live)
-        except OSError as exc:
-            logging.warning("dashboard not started: %s", exc)
+    live.update(on_battery=watcher.on_battery, since=time.time() if watcher.on_battery else None)
 
     def power_saver() -> None:
         live.update(on_battery=True, since=time.time())

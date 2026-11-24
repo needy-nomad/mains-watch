@@ -1,45 +1,29 @@
-"""Onboarding wizard tests: a fake network whose devices drop off when 'unplugged'."""
+"""Browser setup backend: Setup logic on a fake LAN, plus the HTTP endpoints' guards."""
+import http.client
 import ipaddress
+import json
 import pathlib
+import socket
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import dashboard  # noqa: E402
 import onboard  # noqa: E402
 
 NET = ipaddress.ip_network("10.0.0.0/24")
-GATEWAY, OWN = "10.0.0.1", "10.0.0.2"
+INFO = ("10.0.0.1", "10.0.0.2", NET)                      # router, this PC, network
 
 
-class Wizard:
-    """Runs onboard.main against a fake LAN. `unplug` = devices that vanish when asked."""
-
-    def __init__(self, unplug, answers, devices=("10.0.0.1", "10.0.0.2", "10.0.0.50",
-                                                  "10.0.0.60", "10.0.0.77")):
-        self.alive = set(devices)
-        self.unplug, self.answers, self.out = set(unplug), list(answers), []
-        self.conf = str(pathlib.Path(tempfile.mkdtemp()) / "c.conf")
-
-    def input_fn(self, prompt):
-        if "unplugged" in prompt:
-            self.alive -= self.unplug
-            return ""
-        elif "plug the sensor back" in prompt:
-            self.alive |= self.unplug
-            return ""
-        return self.answers.pop(0) if self.answers else ""
-
-    def run(self):
-        self.rc = onboard.main(self.conf, self.input_fn, lambda ip: ip in self.alive,
-                               self.out.append, network=(GATEWAY, OWN, NET))
-        self.text = "\n".join(self.out)
-        p = pathlib.Path(self.conf)
-        self.cfg = dict(l.split("=") for l in p.read_text().split()) if p.exists() else {}
-        return self
+def make_setup(alive, restarted=None):
+    conf = str(pathlib.Path(tempfile.mkdtemp()) / "c.conf")
+    s = onboard.Setup(conf, lambda: restarted.append(1) if restarted is not None else None,
+                      ping_fn=lambda ip: ip in alive, network=INFO, settle=0)
+    return s, conf
 
 
-class OnboardTests(unittest.TestCase):
+class ScanTests(unittest.TestCase):
     def test_scan_finds_alive_hosts(self):
         self.assertEqual(onboard.scan(NET, lambda ip: ip in {"10.0.0.9", "10.0.0.8"}),
                          {"10.0.0.9", "10.0.0.8"})
@@ -48,7 +32,7 @@ class OnboardTests(unittest.TestCase):
         calls = {}
         def flaky(ip):
             calls[ip] = calls.get(ip, 0) + 1
-            return ip == "10.0.0.9" and calls[ip] == 2    # only the second probe answers
+            return ip == "10.0.0.9" and calls[ip] == 2
         self.assertEqual(onboard.scan(NET, flaky), {"10.0.0.9"})
 
     def test_vanished_ignores_router_and_self_and_sorts(self):
@@ -56,44 +40,107 @@ class OnboardTests(unittest.TestCase):
                                           {"10.0.0.2"}, {"10.0.0.1", "10.0.0.2"}),
                          ["10.0.0.9", "10.0.0.10"])
 
-    def test_one_device_vanishes_defaults_accepted(self):
-        w = Wizard({"10.0.0.50"}, []).run()          # every prompt answered with Enter
-        self.assertEqual(w.rc, 0)
-        self.assertEqual(w.cfg, {"SENSOR_IP": "10.0.0.50", "GPU_CAP_WATTS": "150",
-                                 "CHECK_EVERY": "1", "OUTAGE_CONFIRM": "3"})
-        self.assertIn("is back online", w.text)
-
-    def test_several_vanish_user_picks_second(self):
-        w = Wizard({"10.0.0.50", "10.0.0.60"}, ["2"]).run()
-        self.assertEqual(w.cfg["SENSOR_IP"], "10.0.0.60")
-
-    def test_declining_suggestion_allows_manual_ip(self):
-        w = Wizard({"10.0.0.50"}, ["n", "10.0.0.77"]).run()
-        self.assertEqual(w.cfg["SENSOR_IP"], "10.0.0.77")
-
-    def test_nothing_vanishes_manual_ip_or_quit(self):
-        w = Wizard(set(), ["10.0.0.77"]).run()
-        self.assertIn("No device disappeared", w.text)
-        self.assertEqual(w.cfg["SENSOR_IP"], "10.0.0.77")
-        q = Wizard(set(), [""]).run()                # Enter = quit
-        self.assertEqual(q.rc, 1)
-        self.assertEqual(q.cfg, {})
-
-    def test_custom_settings_written(self):
-        w = Wizard({"10.0.0.50"}, ["y", "120", "2", "4"]).run()
-        self.assertEqual((w.cfg["GPU_CAP_WATTS"], w.cfg["CHECK_EVERY"], w.cfg["OUTAGE_CONFIRM"]),
-                         ("120", "2", "4"))
-
-    def test_empty_network(self):
-        w = Wizard(set(), ["10.0.0.5"], devices=()).run()
-        self.assertEqual(w.cfg["SENSOR_IP"], "10.0.0.5")
-
     def test_set_key_preserves_other_lines(self):
         p = pathlib.Path(tempfile.mkdtemp()) / "c.conf"
         p.write_text("# note\nSENSOR_IP=1.1.1.1\nHIBERNATE_AFTER=600\n")
         onboard.set_key(str(p), "SENSOR_IP", "2.2.2.2")
         onboard.set_key(str(p), "GPU_CAP_WATTS", "150")
         self.assertEqual(p.read_text(), "# note\nSENSOR_IP=2.2.2.2\nHIBERNATE_AFTER=600\nGPU_CAP_WATTS=150\n")
+
+
+class SetupTests(unittest.TestCase):
+    def test_full_flow_unplug_detects_sensor_and_saves(self):
+        alive = {"10.0.0.1", "10.0.0.2", "10.0.0.50", "10.0.0.60"}
+        restarted = []
+        s, conf = make_setup(alive, restarted)
+        r = s.scan()
+        self.assertEqual(r["found"], ["10.0.0.50", "10.0.0.60"])
+        alive.discard("10.0.0.50")                       # user unplugs the sensor
+        self.assertEqual(s.unplugged(), {"gone": ["10.0.0.50"]})
+        self.assertEqual(s.check("10.0.0.50"), {"online": False})
+        alive.add("10.0.0.50")                           # plugged back in
+        self.assertEqual(s.check("10.0.0.50"), {"online": True})
+        self.assertEqual(s.save({"sensor": "10.0.0.50", "cap": "120", "every": "2", "confirm": "4"}),
+                         {"ok": True})
+        self.assertEqual(s.config(), {"SENSOR_IP": "10.0.0.50", "GPU_CAP_WATTS": "120.0",
+                                      "CHECK_EVERY": "2.0", "OUTAGE_CONFIRM": "4"})
+        import time; time.sleep(1.3)
+        self.assertEqual(restarted, [1])                 # service asked to restart
+
+    def test_nothing_vanishes(self):
+        s, _ = make_setup({"10.0.0.1", "10.0.0.2", "10.0.0.50"})
+        s.scan()
+        self.assertEqual(s.unplugged(), {"gone": []})
+
+    def test_unplugged_before_scan_is_an_error(self):
+        s, _ = make_setup(set())
+        self.assertIn("error", s.unplugged())
+
+    def test_save_rejects_bad_input_and_writes_nothing(self):
+        restarted = []
+        s, conf = make_setup(set(), restarted)
+        good = {"sensor": "10.0.0.50", "cap": "150", "every": "1", "confirm": "3"}
+        for bad in ({**good, "sensor": "not-an-ip"}, {**good, "sensor": "10.0.0.1"},   # router
+                    {**good, "sensor": "10.0.0.2"}, {**good, "sensor": "10.0.0.5; rm -rf /"},
+                    {**good, "sensor": "::1"}, {**good, "cap": "5"}, {**good, "cap": "abc"},
+                    {**good, "every": "0"}, {**good, "confirm": "0"}, {"sensor": "10.0.0.50"}):
+            self.assertIn("error", s.save(bad), bad)
+        self.assertFalse(pathlib.Path(conf).exists())
+        self.assertEqual(restarted, [])
+
+    def test_no_network_is_reported(self):
+        s = onboard.Setup("/nonexistent", lambda: None, ping_fn=lambda ip: False, network=None)
+        s.net_info = None
+        self.assertIn("error", s.scan())
+
+
+class HttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with socket.socket() as sk:
+            sk.bind(("127.0.0.1", 0))
+            cls.port = sk.getsockname()[1]
+        cls.restarted = []
+        cls.setup, cls.conf = make_setup({"10.0.0.1", "10.0.0.2", "10.0.0.50"}, cls.restarted)
+        cls.events = str(pathlib.Path(tempfile.mkdtemp()) / "e.jsonl")
+        dashboard.serve(cls.port, cls.events, {"on_battery": False}, cls.setup)
+
+    def req(self, method, path, body=None, headers=None, host=None):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        h = {"Host": host or f"127.0.0.1:{self.port}", **(headers or {})}
+        c.request(method, path, json.dumps(body) if body is not None else None, h)
+        r = c.getresponse()
+        return r.status, r.read()
+
+    OK = {"X-Setup": "1", "Content-Type": "application/json"}
+
+    def test_pages_served(self):
+        for path, text in (("/", b"Mains watch"), ("/setup", b"Find your sensor")):
+            st, body = self.req("GET", path)
+            self.assertEqual(st, 200)
+            self.assertIn(text, body)
+
+    def test_post_works_with_header(self):
+        st, body = self.req("POST", "/api/setup/scan", {}, self.OK)
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(body)["found"], ["10.0.0.50"])
+
+    def test_post_without_header_is_refused(self):          # what a cross-site form/fetch looks like
+        st, _ = self.req("POST", "/api/setup/save",
+                         {"sensor": "10.0.0.50", "cap": 150, "every": 1, "confirm": 3},
+                         {"Content-Type": "text/plain"})
+        self.assertEqual(st, 403)
+        self.assertFalse(pathlib.Path(self.conf).exists())
+
+    def test_post_with_foreign_host_is_refused(self):       # DNS-rebinding
+        st, _ = self.req("POST", "/api/setup/scan", {}, self.OK, host="evil.example.com")
+        self.assertEqual(st, 403)
+
+    def test_unknown_post_and_bad_json(self):
+        self.assertEqual(self.req("POST", "/api/setup/nope", {}, self.OK)[0], 404)
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/api/setup/check", "{not json", {**self.OK, "Host": f"127.0.0.1:{self.port}"})
+        self.assertEqual(c.getresponse().status, 400)
 
 
 if __name__ == "__main__":

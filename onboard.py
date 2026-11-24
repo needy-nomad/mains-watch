@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Interactive setup: finds your sensor by watching which device disappears when you
-unplug it, then writes /etc/mains-watch.conf. Run by install.sh (needs root).
-
-    sudo ./install.sh --setup
-"""
+"""Setup backend for the dashboard's /setup page: finds the sensor by watching which
+device disappears when it is unplugged, then writes the config and restarts the service."""
 
 import ipaddress
 import re
-import shutil
 import subprocess
-import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -65,83 +61,64 @@ def set_key(path: str, key: str, value) -> None:
     p.write_text("\n".join(lines) + "\n")
 
 
-def ask(prompt: str, default: str = "", input_fn=input) -> str:
-    answer = input_fn(f"{prompt}" + (f" [{default}]" if default else "") + ": ").strip()
-    return answer or default
 
+class Setup:
+    """State for one browser setup session. Methods return JSON-able dicts."""
 
-def pick_sensor(net, gateway, own, input_fn, ping_fn, say) -> str:
-    ignore = {gateway, own}
-    say(f"\nScanning {net} for devices (about 10 s)...")
-    before = scan(net, ping_fn) - ignore
-    say(f"Found {len(before)} devices answering ping.")
-    if not before:
-        return ask("No devices found. Type the sensor's IP", input_fn=input_fn)
+    def __init__(self, conf: str, restart, ping_fn=ping, network=None, settle: float = 4.0) -> None:
+        self.conf, self.restart, self.ping_fn, self.settle = conf, restart, ping_fn, settle
+        self.net_info = network or local_network()
+        self.before: set = set()
 
-    say("\nNow UNPLUG the sensor (the Wi-Fi device on the wall socket that is NOT on the UPS).")
-    input_fn("Press Enter once it is unplugged... ")
-    time.sleep(1 if ping_fn is not ping else 4)       # let it drop off the network
-    after = scan(net, ping_fn)
-    gone = vanished(before, after, ignore)
+    def _ignore(self) -> set:
+        return {self.net_info[0], self.net_info[1]} if self.net_info else set()
 
-    if len(gone) == 1:
-        say(f"\nThat device went offline: {gone[0]}")
-        sensor = gone[0] if ask("Use it as the sensor? (y/n)", "y", input_fn).lower().startswith("y") \
-            else ask("Type the sensor's IP", input_fn=input_fn)
-    elif gone:
-        say("\nSeveral devices went offline:")
-        for i, ip in enumerate(gone, 1):
-            say(f"  {i}. {ip}")
-        choice = ask("Number of the sensor (or type an IP)", "1", input_fn)
-        sensor = gone[int(choice) - 1] if choice.isdigit() and 0 < int(choice) <= len(gone) else choice
-    else:
-        say("\nNo device disappeared. It may not answer ping, or it was not unplugged.")
-        sensor = ask("Type the sensor's IP, or press Enter to quit", input_fn=input_fn)
+    def scan(self) -> dict:
+        if not self.net_info:
+            return {"error": "No network connection found. Connect to Wi-Fi/LAN first."}
+        self.before = scan(self.net_info[2], self.ping_fn) - self._ignore()
+        return {"found": sorted(self.before, key=ipaddress.ip_address), "router": self.net_info[0]}
 
-    if sensor:
-        input_fn("Now plug the sensor back in and press Enter... ")
-        for _ in range(10):
-            if ping_fn(sensor):
-                say(f"{sensor} is back online.")
-                break
-            time.sleep(0 if ping_fn is not ping else 2)
-        else:
-            say(f"Warning: {sensor} has not come back yet; check it is plugged in.")
-    return sensor
+    def unplugged(self) -> dict:
+        if not self.before:
+            return {"error": "Run the scan first."}
+        time.sleep(self.settle)                     # let the device drop off the network
+        after = scan(self.net_info[2], self.ping_fn)
+        return {"gone": vanished(self.before, after, self._ignore())}
 
+    def check(self, ip: str) -> dict:
+        return {"online": self._valid_ip(ip) and self.ping_fn(ip)}
 
-def main(conf: str, input_fn=input, ping_fn=ping, say=print, network=None) -> int:
-    say("mains-watch setup\n=================")
-    net_info = network or local_network()
-    if not net_info:
-        say("No default network route found. Connect to your Wi-Fi/LAN first.")
-        return 1
-    gateway, own, net = net_info
-    say(f"This PC: {own}   Router: {gateway}")
+    def _valid_ip(self, ip) -> bool:
+        try:
+            return ipaddress.ip_address(ip).version == 4
+        except ValueError:
+            return False
 
-    if shutil.which("nvidia-smi"):
-        gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,power.draw", "--format=csv,noheader"],
-                             capture_output=True, text=True).stdout.strip()
-        say(f"GPU: {gpu or 'nvidia-smi found but returned nothing'}")
-    else:
-        say("Warning: nvidia-smi not found; GPU halting will be disabled (power-saver still works).")
+    def config(self) -> dict:
+        values = {}
+        try:
+            for line in Path(self.conf).read_text().splitlines():
+                line = line.split("#")[0]
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    values[k.strip()] = v.strip()
+        except OSError:
+            pass
+        return values
 
-    sensor = pick_sensor(net, gateway, own, input_fn, ping_fn, say)
-    if not sensor:
-        say("No sensor chosen; nothing written.")
-        return 1
-
-    say("\nSettings (press Enter to keep the default)")
-    cap = ask("GPU power cap in watts while on battery", "150", input_fn)
-    every = ask("Seconds between sensor checks", "1", input_fn)
-    confirm = ask("Missed checks in a row before a power cut is declared", "3", input_fn)
-
-    for key, value in (("SENSOR_IP", sensor), ("GPU_CAP_WATTS", cap),
-                       ("CHECK_EVERY", every), ("OUTAGE_CONFIRM", confirm)):
-        set_key(conf, key, value)
-    say(f"\nSaved to {conf}. Edit it any time, then: sudo systemctl restart mains-watch")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "/etc/mains-watch.conf"))
+    def save(self, data: dict) -> dict:
+        try:
+            sensor = str(data["sensor"]).strip()
+            cap, every, confirm = float(data["cap"]), float(data["every"]), int(data["confirm"])
+        except (KeyError, ValueError, TypeError):
+            return {"error": "Invalid values."}
+        if not self._valid_ip(sensor) or sensor in self._ignore():
+            return {"error": "Sensor must be a valid IPv4 address, not the router or this PC."}
+        if not (50 <= cap <= 600 and 0.2 <= every <= 60 and 1 <= confirm <= 20):
+            return {"error": "Out of range: cap 50-600 W, interval 0.2-60 s, misses 1-20."}
+        for key, value in (("SENSOR_IP", sensor), ("GPU_CAP_WATTS", cap), ("CHECK_EVERY", every),
+                           ("OUTAGE_CONFIRM", confirm)):
+            set_key(self.conf, key, value)
+        threading.Timer(1.0, self.restart).start()  # systemd brings us back with the new config
+        return {"ok": True}

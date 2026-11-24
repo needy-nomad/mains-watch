@@ -209,8 +209,40 @@ class DaemonTests(unittest.TestCase):
         finally:
             m.CHECK_EVERY, m.GPU_CAP_WATTS, m.SENSOR_CHECK, m.HIBERNATE_AFTER = saved
 
+    def test_first_run_without_sensor_serves_setup_and_stays_up(self):
+        import onboard
+        info = onboard.local_network()
+        if not info or str(info[2]) != "192.168.1.0/24":
+            self.skipTest("test fakes devices on 192.168.1.0/24")
+        env = dict(os.environ, PATH=f"{HERE / 'fakebin'}:{os.environ['PATH']}",
+                   FAKE_NET_DIR=str(self.d / "net"), MAINS_WATCH_CONF=str(self.d / "new.conf"),
+                   SENSOR_IP="", DASHBOARD_PORT=str(self.port), EVENTS_FILE=str(self.d / "e.jsonl"),
+                   STATE_FILE=str(self.d / "s.json"))
+        self.daemon = subprocess.Popen([sys.executable, str(ROOT / "mains_watch.py")], env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.wait_for(lambda: self.api().get("setup_needed") is True)
+        self.assertIn(b"Find your sensor",
+                      urllib.request.urlopen(f"http://127.0.0.1:{self.port}/setup", timeout=2).read())
+        time.sleep(1)
+        self.assertIsNone(self.daemon.poll())                # no crash loop without a sensor
+
+        def post(path, body):
+            rq = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", json.dumps(body).encode(),
+                                        {"X-Setup": "1", "Content-Type": "application/json"})
+            return json.load(urllib.request.urlopen(rq, timeout=60))
+        net = self.d / "net"
+        (net / "192.168.1.1").write_text("")                  # router (ignored by the scan)
+        (net / "192.168.1.77").write_text("")                 # the sensor
+        self.assertIn("192.168.1.77", post("/api/setup/scan", {})["found"])
+        (net / "192.168.1.77").unlink()                       # unplug
+        self.assertEqual(post("/api/setup/unplugged", {})["gone"], ["192.168.1.77"])
+        self.assertEqual(post("/api/setup/save", {"sensor": "192.168.1.77", "cap": 140,
+                                                  "every": 1, "confirm": 3}), {"ok": True})
+        self.daemon.wait(timeout=10)                          # exits so systemd restarts it
+        self.assertIn("SENSOR_IP=192.168.1.77", (self.d / "new.conf").read_text())
+
     def test_missing_sensor_ip_refuses_to_run(self):
-        env = dict(os.environ, MAINS_WATCH_CONF=str(self.d / "none.conf"), SENSOR_IP="")
+        env = dict(os.environ, MAINS_WATCH_CONF=str(self.d / "none.conf"), SENSOR_IP="", DASHBOARD_PORT="0")
         r = subprocess.run([sys.executable, str(ROOT / "mains_watch.py")], env=env,
                            capture_output=True, text=True, timeout=10)
         self.assertNotEqual(r.returncode, 0)
