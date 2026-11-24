@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Fake nvidia-smi for tests. State lives in $FAKE_GPU_DIR (pids, power, calls.log, locked)."""
+import os, sys
+d = os.environ["FAKE_GPU_DIR"]
+args = sys.argv[1:]
+open(os.path.join(d, "calls.log"), "a").write(" ".join(args) + "\n")
+def rd(n, default=""):
+    try:
+        return open(os.path.join(d, n)).read()
+    except OSError:
+        return default
+if args[:1] == ["--query-compute-apps=pid"]:
+    print(rd("pids").strip())
+elif args[:1] == ["--query-gpu=power.draw"]:
+    print(rd("power", "30.0").strip())
+elif args[:1] == ["--query-supported-clocks=gr"]:
+    print("3090\n1500\n180")
+elif args[:1] == ["-lgc"]:
+    if os.path.exists(os.path.join(d, "fail_lock")):
+        sys.exit("Insufficient Permissions")
+    open(os.path.join(d, "locked"), "w").write(args[1])
+elif args[:1] == ["-rgc"]:
+    try: os.remove(os.path.join(d, "locked"))
+    except OSError: pass
+else:
+    sys.exit(2)

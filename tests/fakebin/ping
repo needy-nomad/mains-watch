@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fake ping: host answers iff file $FAKE_NET_DIR/<ip> exists.
+for last; do :; done
+[ -e "$FAKE_NET_DIR/$last" ]

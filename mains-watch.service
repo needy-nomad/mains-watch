@@ -1,0 +1,18 @@
+[Unit]
+Description=Mains watcher: halt GPU on power cut, resume on restore
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/mains-watch/mains_watch.py
+Restart=always
+RestartSec=2
+RuntimeDirectory=mains-watch
+RuntimeDirectoryPreserve=yes
+TimeoutStopSec=20
+OOMScoreAdjust=-900
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
