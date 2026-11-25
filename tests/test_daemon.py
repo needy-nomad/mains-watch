@@ -261,6 +261,21 @@ class DaemonTests(unittest.TestCase):
         finally:
             m.CHECK_EVERY, m.GPU_CAP_WATTS, m.SENSOR_CHECK, m.HIBERNATE_AFTER = saved
 
+    def test_config_accepts_saved_floats_and_survives_garbage(self):
+        sys.path.insert(0, str(ROOT))
+        import mains_watch as m
+        conf = self.d / "f.conf"           # what the settings page writes, plus junk
+        conf.write_text("GPU_CAP_WATTS=150.0\nOUTAGE_CONFIRM=3.0\nGPU_POLL_EVERY=30.0\nCHECK_EVERY=abc\n")
+        keys = ("GPU_CAP_WATTS", "OUTAGE_CONFIRM", "GPU_POLL_EVERY", "CHECK_EVERY")
+        saved = [getattr(m, k) for k in keys]
+        try:
+            m.load_config(str(conf))
+            self.assertEqual((m.GPU_CAP_WATTS, m.OUTAGE_CONFIRM, m.GPU_POLL_EVERY), (150, 3, 30.0))
+            self.assertEqual(m.CHECK_EVERY, saved[3])          # garbage ignored, default kept
+        finally:
+            for k, v in zip(keys, saved):
+                setattr(m, k, v)
+
     def test_first_run_without_sensor_serves_setup_and_stays_up(self):
         import onboard
         info = onboard.local_network()

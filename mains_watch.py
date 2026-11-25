@@ -192,10 +192,12 @@ def load_config(path: str) -> None:
             g[key] = None if not isinstance(default, str) or key == "LOG_FILE" else ""
         elif isinstance(default, str):
             g[key] = raw
-        elif isinstance(default, (int, float)) and not isinstance(default, bool):
-            g[key] = type(default)(raw)
-        else:                                   # None-default numeric settings
-            g[key] = int(raw)
+        else:                                   # numeric; "150.0" is fine for an int setting
+            try:
+                num = float(raw)
+                g[key] = num if isinstance(default, float) else int(num)
+            except ValueError:                  # a bad value must never stop protection
+                logging.getLogger("mains-watch").warning("ignoring bad %s=%r", key, raw)
 
 
 def main() -> None:
